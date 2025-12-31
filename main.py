@@ -6,14 +6,13 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import customtkinter as ctk
 import threading
-from typing import Optional, Dict, Any
+from typing import Optional
 
 
 # ============================================================
 # FORMATTING HELPERS
 # ============================================================
 def _sf(x, default=None):
-    """Safe float."""
     try:
         if x is None:
             return default
@@ -54,19 +53,18 @@ def fmt_money(x, nd=2):
 
 
 def fmt_big_money(x):
-    """Format big $ values in B/M/K if possible."""
     if x is None:
         return "N/A"
     try:
         v = float(x)
-        abs_v = abs(v)
-        if abs_v >= 1e12:
+        av = abs(v)
+        if av >= 1e12:
             return f"${v/1e12:,.2f}T"
-        if abs_v >= 1e9:
+        if av >= 1e9:
             return f"${v/1e9:,.2f}B"
-        if abs_v >= 1e6:
+        if av >= 1e6:
             return f"${v/1e6:,.2f}M"
-        if abs_v >= 1e3:
+        if av >= 1e3:
             return f"${v/1e3:,.2f}K"
         return f"${v:,.0f}"
     except Exception:
@@ -79,16 +77,12 @@ def first_col_like(df: pd.DataFrame, prefix: str) -> Optional[str]:
 
 
 def latest_statement_value(stmt: pd.DataFrame, row_name: str) -> Optional[float]:
-    """
-    yfinance statements are DataFrames with rows as line items and columns as dates.
-    Returns latest column value for a given row.
-    """
     try:
         if stmt is None or stmt.empty:
             return None
         if row_name not in stmt.index:
             return None
-        latest_col = stmt.columns[0]  # yfinance usually returns latest first
+        latest_col = stmt.columns[0]
         return _sf(stmt.loc[row_name, latest_col], None)
     except Exception:
         return None
@@ -98,77 +92,63 @@ def latest_statement_value(stmt: pd.DataFrame, row_name: str) -> Optional[float]
 # --- DEEP DATA ENGINE ---
 # ============================================================
 def get_pro_analysis(ticker_symbol: str):
-    """
-    Returns:
-      - df: price dataframe with deep technical indicators + levels
-      - fundamentals: dict with raw key fundamental fields + computed metrics + formatted dashboard text
-    """
     try:
         ticker = yf.Ticker(ticker_symbol)
 
-        # Use 2y daily to support 200D + 52W structure; still reasonably fast.
+        # 2y daily so we can use 200D + 52W structure
         df = ticker.history(period="2y", interval="1d", auto_adjust=False)
         if df.empty or len(df) < 120:
             return None, None
 
-        df = df.copy()
-        df.dropna(inplace=True)
+        df = df.copy().dropna()
 
         # ----------------------------
-        # TECHNICALS (Deeper Stack)
+        # TECHNICALS (Deep Stack)
         # ----------------------------
-        # Trend + momentum
         df.ta.ema(length=20, append=True)
         df.ta.ema(length=50, append=True)
-        df.ta.sma(length=200, append=True)          # long-term regime
+        df.ta.sma(length=200, append=True)
+
         df.ta.rsi(length=14, append=True)
         df.ta.stochrsi(length=14, append=True)
         df.ta.macd(fast=12, slow=26, signal=9, append=True)
         df.ta.adx(length=14, append=True)
 
-        # Volatility + bands
         df.ta.atr(length=14, append=True)
         df.ta.bbands(length=20, append=True)
 
-        # Volume / flow
         df.ta.obv(append=True)
         df.ta.mfi(length=14, append=True)
 
-        # Trend-following filter
-        # (supertrend column names vary slightly; still very useful when present)
         try:
             df.ta.supertrend(length=10, multiplier=3.0, append=True)
         except Exception:
             pass
 
-        # Relative volume (confirmation / exhaustion)
         df["VOL_MA20"] = df["Volume"].rolling(window=20).mean()
         df["RVOL"] = df["Volume"] / df["VOL_MA20"]
 
         # ----------------------------
-        # MARKET GEOMETRY (Levels)
+        # MARKET GEOMETRY
         # ----------------------------
         df["RES_50"] = df["High"].rolling(window=50).max()
         df["SUP_50"] = df["Low"].rolling(window=50).min()
         df["RES_200"] = df["High"].rolling(window=200).max()
         df["SUP_200"] = df["Low"].rolling(window=200).min()
 
-        # 52-week structure (252 trading days)
         df["HI_52W"] = df["High"].rolling(window=252).max()
         df["LO_52W"] = df["Low"].rolling(window=252).min()
 
         # ----------------------------
-        # FUNDAMENTALS (Deeper Stack)
+        # FUNDAMENTALS (Deep Stack)
         # ----------------------------
-        info = {}
         try:
             info = ticker.info or {}
         except Exception:
             info = {}
 
-        # Statements (annual)
         try:
-            fin = ticker.financials  # income statement
+            fin = ticker.financials
         except Exception:
             fin = pd.DataFrame()
 
@@ -182,7 +162,6 @@ def get_pro_analysis(ticker_symbol: str):
         except Exception:
             cf = pd.DataFrame()
 
-        # Core info fields (availability varies by ticker/market)
         market_cap = _sf(info.get("marketCap"), None)
         enterprise_value = _sf(info.get("enterpriseValue"), None)
 
@@ -212,7 +191,6 @@ def get_pro_analysis(ticker_symbol: str):
         total_cash = _sf(info.get("totalCash"), None)
         total_debt = _sf(info.get("totalDebt"), None)
 
-        # Try to compute/confirm from statements where possible
         ebitda = _sf(info.get("ebitda"), None)
         if ebitda is None:
             ebitda = latest_statement_value(fin, "EBITDA")
@@ -223,17 +201,15 @@ def get_pro_analysis(ticker_symbol: str):
 
         net_income = latest_statement_value(fin, "Net Income")
 
-        # Cash flow
         fcf = _sf(info.get("freeCashflow"), None)
         if fcf is None:
             cfo = latest_statement_value(cf, "Total Cash From Operating Activities")
-            capex = latest_statement_value(cf, "Capital Expenditures")  # often negative
+            capex = latest_statement_value(cf, "Capital Expenditures")
             if cfo is not None and capex is not None:
-                fcf = cfo + capex  # capex negative -> subtract in effect
+                fcf = cfo + capex
 
         op_cf = latest_statement_value(cf, "Total Cash From Operating Activities")
 
-        # Debt metrics
         net_debt = None
         if total_debt is not None and total_cash is not None:
             net_debt = total_debt - total_cash
@@ -250,7 +226,6 @@ def get_pro_analysis(ticker_symbol: str):
         if net_debt is not None and ebitda not in (None, 0):
             net_debt_to_ebitda = net_debt / ebitda
 
-        # Short/ownership (optional)
         short_pct_float = _sf(info.get("shortPercentOfFloat"), None)
         short_ratio = _sf(info.get("shortRatio"), None)
         inst_own = _sf(info.get("heldPercentInstitutions"), None)
@@ -260,7 +235,6 @@ def get_pro_analysis(ticker_symbol: str):
 
         name = info.get("shortName") or info.get("longName") or ticker_symbol
 
-        # Build the NEW “Key Fundamental Metrics” dashboard text
         fund_dashboard = (
             f"KEY FUNDAMENTAL METRICS DASHBOARD\n"
             f"------------------------------------------------------------\n"
@@ -359,14 +333,14 @@ class TradingApp(ctk.CTk):
         self.df = None
         self.fund = None
 
-        self.title("AI Quant Research Terminal v7.2")
+        self.title("AI Quant Research Terminal v7.3")
         self.geometry("1200x1200")
         ctk.set_appearance_mode("dark")
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # 1. SIDEBAR
+        # SIDEBAR
         self.sidebar = ctk.CTkFrame(self, width=280)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         ctk.CTkLabel(self.sidebar, text="DEEP SCANNER", font=("Arial", 22, "bold")).pack(pady=20)
@@ -377,17 +351,17 @@ class TradingApp(ctk.CTk):
         self.status = ctk.CTkLabel(self.sidebar, text="System Standby", text_color="gray")
         self.status.pack(side="bottom", pady=20)
 
-        # 2. MAIN AREA
+        # MAIN AREA
         self.main_frame = ctk.CTkScrollableFrame(self)
         self.main_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
 
-        # HEADER: PRICE & TICKER
+        # HEADER
         self.ticker_label = ctk.CTkLabel(self.main_frame, text="--", font=("Arial", 28, "bold"))
         self.ticker_label.pack(pady=(10, 0))
         self.price_label = ctk.CTkLabel(self.main_frame, text="$0.00", font=("Arial", 56, "bold"), text_color="#3498db")
         self.price_label.pack(pady=(0, 5))
 
-        # STATUS TAGS
+        # TAGS
         self.tag_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.tag_frame.pack(fill="x", pady=10)
         self.val_tag = ctk.CTkLabel(self.tag_frame, text="VALUATION: --", font=("Arial", 16, "bold"), height=50,
@@ -397,7 +371,7 @@ class TradingApp(ctk.CTk):
                                      corner_radius=8, fg_color="#333")
         self.tech_tag.pack(side="left", padx=5, expand=True, fill="x")
 
-        # SECTION: MARKET GEOMETRY
+        # MARKET GEOMETRY
         ctk.CTkLabel(self.main_frame, text="MARKET GEOMETRY & LIQUIDITY LEVELS", font=("Arial", 14, "bold")).pack(pady=(15, 5))
         self.levels_frame = ctk.CTkFrame(self.main_frame, fg_color="#1a1a1a")
         self.levels_frame.pack(fill="x", padx=10, pady=5)
@@ -410,7 +384,7 @@ class TradingApp(ctk.CTk):
         self.lo52_lbl = ctk.CTkLabel(self.levels_frame, text="52W LOW: --", font=("Consolas", 18, "bold"), text_color="#54a0ff")
         self.lo52_lbl.grid(row=1, column=1, padx=40, pady=(0, 15))
 
-        # SECTION: TRADE EXECUTION PLAN
+        # EXECUTION PLAN
         ctk.CTkLabel(self.main_frame, text="EXECUTION PLAN (ATR ADAPTIVE)", font=("Arial", 14, "bold")).pack(pady=(15, 5))
         self.exec_frame = ctk.CTkFrame(self.main_frame, fg_color="#0c2461", corner_radius=10)
         self.exec_frame.pack(fill="x", padx=10, pady=5)
@@ -421,29 +395,38 @@ class TradingApp(ctk.CTk):
         self.tp_lbl = ctk.CTkLabel(self.exec_frame, text="TP: --", font=("Consolas", 18, "bold"), text_color="#55efc4")
         self.tp_lbl.grid(row=0, column=2, padx=30, pady=20)
 
-        # SECTION: QUANT RAW (Tech + quick blend)
+        # TECH SNAPSHOT
         ctk.CTkLabel(self.main_frame, text="QUANTITATIVE RAW DATA (TECHNICAL SNAPSHOT)", font=("Arial", 13, "bold")).pack(pady=(15, 0))
         self.metrics_box = ctk.CTkTextbox(self.main_frame, height=170, font=("Consolas", 14), fg_color="#1a1a1a")
         self.metrics_box.pack(fill="x", padx=10, pady=5)
 
-        # NEW SECTION: KEY FUNDAMENTAL METRICS (requested)
-        ctk.CTkLabel(self.main_frame, text="KEY FUNDAMENTAL METRICS (VALUATION • GROWTH • CASH FLOW • BALANCE SHEET)",
+        # FUNDAMENTAL METRICS DASHBOARD
+        ctk.CTkLabel(self.main_frame,
+                     text="KEY FUNDAMENTAL METRICS (VALUATION • GROWTH • CASH FLOW • BALANCE SHEET)",
                      font=("Arial", 13, "bold"), text_color="#82ccdd").pack(pady=(15, 0))
         self.fund_metrics_box = ctk.CTkTextbox(self.main_frame, height=300, font=("Consolas", 13), fg_color="#1a1a1a")
         self.fund_metrics_box.pack(fill="x", padx=10, pady=5)
 
-        # SECTION: AI DEEP DIVE
+        # AI FUNDAMENTALS
         ctk.CTkLabel(self.main_frame, text="DEEP FUNDAMENTAL ANALYSIS (MOAT • QUALITY • VALUATION • RISKS)",
                      font=("Arial", 13, "bold"), text_color="#38ada9").pack(pady=(15, 0))
         self.fund_ai = ctk.CTkTextbox(self.main_frame, height=220, wrap="word")
         self.fund_ai.pack(fill="x", padx=10, pady=5)
 
+        # AI TECHNICALS
         ctk.CTkLabel(self.main_frame, text="DEEP TECHNICAL ANALYSIS (REGIME • CONFLUENCE • LEVELS • PLAN)",
                      font=("Arial", 13, "bold"), text_color="#e58e26").pack(pady=(15, 0))
         self.tech_ai = ctk.CTkTextbox(self.main_frame, height=220, wrap="word")
         self.tech_ai.pack(fill="x", padx=10, pady=5)
 
-        self.btn_chart = ctk.CTkButton(self.main_frame, text="📊 Open Advanced Multi-Pane Chart", command=self.show_chart, state="disabled")
+        # NEW: CONCLUSION & STRATEGY
+        ctk.CTkLabel(self.main_frame, text="CONCLUSION & STRATEGY (INTEGRATED INTERPRETATION)",
+                     font=("Arial", 13, "bold"), text_color="#b8e994").pack(pady=(15, 0))
+        self.conclusion_ai = ctk.CTkTextbox(self.main_frame, height=240, wrap="word")
+        self.conclusion_ai.pack(fill="x", padx=10, pady=5)
+
+        self.btn_chart = ctk.CTkButton(self.main_frame, text="📊 Open Advanced Multi-Pane Chart",
+                                       command=self.show_chart, state="disabled")
         self.btn_chart.pack(pady=20)
 
     def start_thread(self):
@@ -463,14 +446,12 @@ class TradingApp(ctk.CTk):
         self.fund = f
         curr = float(df["Close"].iloc[-1])
 
-        # Pull key columns safely
+        # Columns
         rsi_col = first_col_like(df, "RSI")
         adx_col = first_col_like(df, "ADX")
         atr_col = first_col_like(df, "ATR")
-
         ema50_col = first_col_like(df, "EMA_50")
         sma200_col = first_col_like(df, "SMA_200")
-
         macd_line_col = first_col_like(df, "MACD_")
         macd_hist_col = first_col_like(df, "MACDh_")
         macd_sig_col = first_col_like(df, "MACDs_")
@@ -478,7 +459,6 @@ class TradingApp(ctk.CTk):
         rsi = float(df[rsi_col].iloc[-1]) if rsi_col else None
         adx = float(df[adx_col].iloc[-1]) if adx_col else None
         atr = float(df[atr_col].iloc[-1]) if atr_col else None
-
         ema50 = float(df[ema50_col].iloc[-1]) if ema50_col else None
         sma200 = float(df[sma200_col].iloc[-1]) if sma200_col else None
 
@@ -488,21 +468,14 @@ class TradingApp(ctk.CTk):
 
         rvol = float(df["RVOL"].iloc[-1]) if "RVOL" in df.columns else None
 
-        # ----------------------------
-        # VALUATION TAG (improved heuristic)
-        # ----------------------------
-        # If target is present, retain your target-vs-price logic, but add an internal quality/price overlay.
-        target = f.get("target")
-        target_based = None
-        if target not in (None, 0):
-            if target > curr * 1.10:
-                target_based = "UNDERVALUED"
-            elif target < curr * 0.90:
-                target_based = "OVERVALUED"
-            else:
-                target_based = "FAIR VALUE"
+        res_50 = float(df["RES_50"].iloc[-1])
+        sup_50 = float(df["SUP_50"].iloc[-1])
+        hi_52w = float(df["HI_52W"].iloc[-1]) if not pd.isna(df["HI_52W"].iloc[-1]) else None
+        lo_52w = float(df["LO_52W"].iloc[-1]) if not pd.isna(df["LO_52W"].iloc[-1]) else None
 
-        # Quality/price heuristics (non-sector-adjusted, but more informative than a single threshold)
+        # ----------------------------
+        # Valuation overlay score
+        # ----------------------------
         score = 0
         if f.get("fcf_yield") is not None:
             score += 1 if f["fcf_yield"] >= 0.05 else (-1 if f["fcf_yield"] <= 0.02 else 0)
@@ -522,7 +495,18 @@ class TradingApp(ctk.CTk):
         else:
             overlay = "NEUTRAL"
 
-        v_s = target_based if target_based else overlay
+        # Target-based valuation tag if available
+        target = f.get("target")
+        if target not in (None, 0):
+            if target > curr * 1.10:
+                v_s = "UNDERVALUED"
+            elif target < curr * 0.90:
+                v_s = "OVERVALUED"
+            else:
+                v_s = "FAIR VALUE"
+        else:
+            v_s = overlay
+
         if "UNDER" in v_s or "ATTRACTIVE" in v_s:
             v_c = "#2ecc71"
         elif "OVER" in v_s or "EXPENSIVE" in v_s:
@@ -531,7 +515,7 @@ class TradingApp(ctk.CTk):
             v_c = "#3498db"
 
         # ----------------------------
-        # TECHNICAL TAG (trend regime + momentum)
+        # Technical regime tag
         # ----------------------------
         regime = "RANGE / TRANSITION"
         if sma200 is not None and ema50 is not None and adx is not None:
@@ -560,7 +544,7 @@ class TradingApp(ctk.CTk):
             t_c = "#3498db"
 
         # ----------------------------
-        # RAW TECH METRICS DISPLAY (expanded)
+        # Technical snapshot
         # ----------------------------
         metric_txt = (
             f"--- TREND / MOMENTUM ---                 --- VOL / FLOW ---\n"
@@ -572,14 +556,8 @@ class TradingApp(ctk.CTk):
         )
 
         # ----------------------------
-        # TRADE PLAN (ATR + structure-aware)
+        # Execution plan (ATR + structure)
         # ----------------------------
-        res_50 = float(df["RES_50"].iloc[-1])
-        sup_50 = float(df["SUP_50"].iloc[-1])
-        hi_52w = float(df["HI_52W"].iloc[-1]) if not pd.isna(df["HI_52W"].iloc[-1]) else None
-        lo_52w = float(df["LO_52W"].iloc[-1]) if not pd.isna(df["LO_52W"].iloc[-1]) else None
-
-        # stop: below support and volatility cushion
         if atr is None:
             atr = max(0.01 * curr, 1.0)
 
@@ -587,9 +565,8 @@ class TradingApp(ctk.CTk):
         tp = curr + (3.0 * atr)
 
         # ----------------------------
-        # AI PROMPTS (much deeper)
+        # AI PROMPTS (Fund + Tech + Conclusion)
         # ----------------------------
-        # Fundamental prompt: multi-dimension output
         f_p = f"""
 You are a buy-side equity analyst. Write a deep but concise fundamental note for {ticker}.
 Use bullet points and clear section headers. Keep it to ~12-16 bullets total.
@@ -604,7 +581,7 @@ Include:
 7) 3 key bull-case catalysts and 3 key bear-case risks
 8) What to monitor next quarter
 
-Metrics (may contain N/A; reason around it):
+Metrics:
 - Market Cap {fmt_big_money(f.get("market_cap"))}, EV {fmt_big_money(f.get("enterprise_value"))}, Beta {fmt_num(f.get("beta"),2)}
 - P/E TTM {fmt_num(f.get("trailing_pe"),2)}, P/E Fwd {fmt_num(f.get("forward_pe"),2)}, PEG {fmt_num(f.get("peg"),2)}
 - EV/EBITDA {fmt_num(f.get("ev_to_ebitda"),2)}, P/S {fmt_num(f.get("ps"),2)}, P/B {fmt_num(f.get("pb"),2)}, FCF Yield {fmt_pct(f.get("fcf_yield"),2)}
@@ -615,11 +592,8 @@ Metrics (may contain N/A; reason around it):
 - Net Debt {fmt_big_money(f.get("net_debt"))}, Net Debt/EBITDA {fmt_num(f.get("net_debt_to_ebitda"),2)}
 - Div Yield {fmt_pct(f.get("div_yield"),2)}, Payout {fmt_pct(f.get("payout"),2)}
 - Street Target Mean {fmt_money(f.get("target"),2)}
-
-Do not add disclaimers. Do not mention you are an AI.
 """.strip()
 
-        # Technical prompt: confluence-based regime read + levels + plan
         t_p = f"""
 You are a technical strategist. Provide a deep technical read for {ticker} using the latest daily data.
 Write bullet points, ~10-14 bullets total.
@@ -640,16 +614,89 @@ Data:
 - ATR {fmt_money(atr,2)}, RVOL {fmt_num(rvol,2)}
 - Resistance(50D) {fmt_money(res_50,2)}, Support(50D) {fmt_money(sup_50,2)}
 - 52W High {fmt_money(hi_52w,2)}, 52W Low {fmt_money(lo_52w,2)}
-
-Do not add disclaimers. Do not mention you are an AI.
 """.strip()
 
+        # NEW: Integrated conclusion prompt
+        c_p = f"""
+You are a portfolio manager writing the final conclusion for a research note on {ticker}.
+Synthesize fundamentals + technicals + levels into a single decision framework.
+
+Output format (use these headers exactly):
+1) OVERALL CALL (Bullish / Neutral / Bearish)
+2) WHY (3-6 bullets integrating fundamentals + technicals)
+3) STRATEGY (choose one): Accumulate / Buy Pullbacks / Breakout Entry / Wait for Confirmation / Avoid
+4) TRADE PLAN (numbers): Entry Zone, Invalidation/Stop, Target 1, Target 2, Time Horizon
+5) RISK MANAGEMENT (3 bullets): sizing, what would change your view, key downside risks
+6) CHECKLIST (5 items): what to verify before taking a position
+
+Use the data below; reason about missing values as "unknown" without inventing numbers.
+
+FUNDAMENTAL TAG: {v_s}
+TECHNICAL TAG: {t_s}
+
+Price: {fmt_money(curr,2)}
+Support(50D): {fmt_money(sup_50,2)}  Resistance(50D): {fmt_money(res_50,2)}
+52W Low: {fmt_money(lo_52w,2)}  52W High: {fmt_money(hi_52w,2)}
+ATR: {fmt_money(atr,2)}  RSI: {fmt_num(rsi,1)}  ADX: {fmt_num(adx,1)}
+EMA50: {fmt_money(ema50,2)}  SMA200: {fmt_money(sma200,2)}
+
+Valuation/Quality:
+P/E TTM {fmt_num(f.get("trailing_pe"),2)}, P/E Fwd {fmt_num(f.get("forward_pe"),2)}, EV/EBITDA {fmt_num(f.get("ev_to_ebitda"),2)}
+FCF Yield {fmt_pct(f.get("fcf_yield"),2)}, ROE {fmt_pct(f.get("roe"),2)}, Net Debt/EBITDA {fmt_num(f.get("net_debt_to_ebitda"),2)}
+Revenue Growth {fmt_pct(f.get("rev_growth"),2)}, Net Margin {fmt_pct(f.get("net_m"),2)}
+Target Mean {fmt_money(f.get("target"),2)}
+
+Important: keep it practical and action-oriented. Do not add disclaimers.
+""".strip()
+
+        # Ollama calls
         try:
             f_res = ollama.generate(model="llama3", prompt=f_p)["response"]
             t_res = ollama.generate(model="llama3", prompt=t_p)["response"]
+            c_res = ollama.generate(model="llama3", prompt=c_p)["response"]
         except Exception:
             f_res = "AI Summary offline."
             t_res = "Technical AI offline."
+            # Deterministic fallback conclusion
+            if "BULL" in t_s and ("UNDER" in v_s or "ATTRACTIVE" in v_s):
+                call = "Bullish"
+                strat = "Buy Pullbacks"
+            elif "BEAR" in t_s and ("OVER" in v_s or "EXPENSIVE" in v_s):
+                call = "Bearish"
+                strat = "Avoid"
+            else:
+                call = "Neutral"
+                strat = "Wait for Confirmation"
+
+            entry_zone = f"{fmt_money(max(sup_50, curr - 1.0 * atr),2)} to {fmt_money(curr,2)}"
+            stop = fmt_money(sl, 2)
+            t1 = fmt_money(tp, 2)
+            t2 = fmt_money(res_50 if res_50 > curr else (curr + 5.0 * atr), 2)
+
+            c_res = (
+                f"1) OVERALL CALL ({call})\n"
+                f"2) WHY\n"
+                f"- Fundamentals tag: {v_s}; Technical regime: {t_s}\n"
+                f"- Price {fmt_money(curr,2)} with Support {fmt_money(sup_50,2)} / Resistance {fmt_money(res_50,2)}; ATR {fmt_money(atr,2)} defines risk.\n"
+                f"- Momentum: RSI {fmt_num(rsi,1)}; Trend strength: ADX {fmt_num(adx,1)}.\n"
+                f"3) STRATEGY: {strat}\n"
+                f"4) TRADE PLAN\n"
+                f"- Entry Zone: {entry_zone}\n"
+                f"- Invalidation/Stop: {stop}\n"
+                f"- Target 1: {t1}\n"
+                f"- Target 2: {t2}\n"
+                f"- Time Horizon: 2–8 weeks (swing framework)\n"
+                f"5) RISK MANAGEMENT\n"
+                f"- Keep position size small enough that a stop-out is tolerable.\n"
+                f"- If price breaks below support with rising volatility, reduce/exit.\n"
+                f"- Reassess if valuation worsens or trend flips below SMA200.\n"
+                f"6) CHECKLIST\n"
+                f"- Confirm earnings date / major catalyst window\n"
+                f"- Confirm liquidity/volume (RVOL)\n"
+                f"- Confirm price vs EMA50/SMA200\n"
+                f"- Confirm stop level is logical (below structure)\n"
+                f"- Confirm risk/reward is favorable (>= 1:2)\n"
+            )
 
         self.after(
             0,
@@ -666,16 +713,16 @@ Do not add disclaimers. Do not mention you are an AI.
                 f.get("dashboard_text", ""),
                 f_res,
                 t_res,
+                c_res,
             ),
         )
 
-    def update_ui(self, name, cp, v_s, v_c, t_s, t_c, sl, tp, m_txt, fund_metrics_txt, f_ai, t_ai):
+    def update_ui(self, name, cp, v_s, v_c, t_s, t_c, sl, tp, m_txt, fund_metrics_txt, f_ai, t_ai, c_ai):
         self.ticker_label.configure(text=str(name).upper())
         self.price_label.configure(text=f"${cp:.2f}")
         self.val_tag.configure(text=v_s, fg_color=v_c)
         self.tech_tag.configure(text=t_s, fg_color=t_c)
 
-        # Market Geometry
         res, sup = float(self.df["RES_50"].iloc[-1]), float(self.df["SUP_50"].iloc[-1])
         hi52 = float(self.df["HI_52W"].iloc[-1]) if not pd.isna(self.df["HI_52W"].iloc[-1]) else None
         lo52 = float(self.df["LO_52W"].iloc[-1]) if not pd.isna(self.df["LO_52W"].iloc[-1]) else None
@@ -685,7 +732,6 @@ Do not add disclaimers. Do not mention you are an AI.
         self.hi52_lbl.configure(text=f"52W HIGH: {fmt_money(hi52,2)}")
         self.lo52_lbl.configure(text=f"52W LOW:  {fmt_money(lo52,2)}")
 
-        # Trade Execution
         self.buy_lbl.configure(text=f"BUY: ${cp:.2f}")
         self.sl_lbl.configure(text=f"SL: ${sl:.2f}")
         self.tp_lbl.configure(text=f"TP: ${tp:.2f}")
@@ -702,11 +748,13 @@ Do not add disclaimers. Do not mention you are an AI.
         self.tech_ai.delete("1.0", "end")
         self.tech_ai.insert("1.0", t_ai)
 
+        self.conclusion_ai.delete("1.0", "end")
+        self.conclusion_ai.insert("1.0", c_ai)
+
         self.btn_chart.configure(state="normal")
         self.status.configure(text="Analysis Finalized", text_color="green")
 
     def show_chart(self):
-        # 3-pane: Price+levels, RSI, MACD
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03)
 
         fig.add_trace(
@@ -727,14 +775,12 @@ Do not add disclaimers. Do not mention you are an AI.
         fig.add_hline(y=float(self.df["SUP_50"].iloc[-1]), line_color="#55efc4", line_dash="dash",
                       annotation_text="SUP(50D)", row=1, col=1)
 
-        # RSI
         rsi_col = first_col_like(self.df, "RSI")
         if rsi_col:
             fig.add_trace(go.Scatter(x=self.df.index, y=self.df[rsi_col], name="RSI(14)"), row=2, col=1)
             fig.add_hline(y=70, line_dash="dot", annotation_text="70", row=2, col=1)
             fig.add_hline(y=30, line_dash="dot", annotation_text="30", row=2, col=1)
 
-        # MACD histogram
         macd_hist_col = first_col_like(self.df, "MACDh_")
         macd_line_col = first_col_like(self.df, "MACD_")
         macd_sig_col = first_col_like(self.df, "MACDs_")
@@ -752,3 +798,4 @@ Do not add disclaimers. Do not mention you are an AI.
 if __name__ == "__main__":
     app = TradingApp()
     app.mainloop()
+
